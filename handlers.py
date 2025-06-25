@@ -8,6 +8,13 @@ import keyboard as kb
 import sqlite3
 import asyncio
 import re
+import bcrypt
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def check_password(password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed_password.encode())
 
 router = Router()
 
@@ -84,6 +91,35 @@ async def reset_state(state: FSMContext):
         await state.clear()
 
 
+async def check_auth(message: Message, state: FSMContext) -> bool:
+    user = await fetch_sql("SELECT password_hash FROM users WHERE user_id = ?", (message.from_user.id,))
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /register.")
+        return False
+
+    auth_data = await state.get_data()
+    if auth_data.get("authenticated"):
+        return True
+
+    await message.answer("🔐 Введите пароль для доступа:", reply_markup=kb.remove_keyboard)
+    await state.set_state("waiting_for_password")
+    return False
+
+@router.message(F.state == "waiting_for_password")
+async def handle_password_input(message: Message, state: FSMContext):
+    user = await fetch_sql("SELECT password_hash FROM users WHERE user_id = ?", (message.from_user.id,))
+    if not user:
+        await state.clear()
+        return
+
+    if check_password(message.text, user[0][0]):
+        await state.update_data(authenticated=True)
+        await message.answer("✅ Доступ разрешен!", reply_markup=kb.main)
+        await state.clear()
+    else:
+        await message.answer("❌ Неверный пароль. Попробуйте еще раз:")
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await reset_state(state)
@@ -121,7 +157,6 @@ async def process_phone(message: Message, state: FSMContext):
     await state.set_state(Register.email)
     await message.answer("Введите email. Пример example@mail.ru:", reply_markup=kb.remove_keyboard)
 
-
 @router.message(Register.email)
 async def process_email(message: Message, state: FSMContext):
     if not is_valid_email(message.text):
@@ -129,14 +164,28 @@ async def process_email(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
+    await message.answer("🔐 Придумайте пароль для доступа к боту:")
+    await state.update_data(email=message.text)
+    await state.set_state(Register.password)  # Новое состояние для пароля
+
+@router.message(Register.password)
+async def process_password(message: Message, state: FSMContext):
+    password = message.text.strip()
+    if len(password) < 4:
+        await message.answer("❌ Пароль должен быть не менее 4 символов. Попробуйте еще раз:")
+        return
+
+    data = await state.get_data()
+    hashed_password = hash_password(password)
+
     success = await execute_sql(
-        "INSERT INTO users (user_id, name, birth_date, phone, email) VALUES (?, ?, ?, ?, ?)",
-        (message.from_user.id, data['name'], data['birth'], data['phone'], message.text)
+        "INSERT INTO users (user_id, name, birth_date, phone, email, password_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        (message.from_user.id, data['name'], data['birth'], data['phone'], data['email'], hashed_password)
     )
 
     if success:
         await message.answer(
-            "✅ Регистрация завершена!\n"
+            "✅ Регистрация завершена! Теперь при каждом входе вводите пароль.",
             f"👤 {data['name']}\n"
             f"🎂 {data['birth']}\n"
             f"📱 {data['phone']}\n"
@@ -147,6 +196,10 @@ async def process_email(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка сохранения", reply_markup=kb.main)
     await state.clear()
 
+@router.message(F.text == 'Внести траты')
+async def add_expense(message: Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
 
 @router.message(F.text == 'Настройки')
 async def settings_menu(message: Message, state: FSMContext):
